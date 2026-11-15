@@ -1,5 +1,5 @@
 """
-ربات تحلیل بیت‌کوین (تایم ۵ و ۱۵ دقیقه و ۱ و ۴ ساعت) برای تلگرام
+ربات تحلیل بیت‌کوین (تایم ۵ و ۱۵ دقیقه و ۱ و ۴ ساعت) برای پیام‌رسان «بله»
 - داده: APIهای عمومی صرافی‌ها (بدون API Key)
 - تحلیل: موتور امتیازدهی اندیکاتوری (EMA, RSI, MACD, Bollinger, ATR, حجم)
 - هوش مصنوعی اختیاری: اگر GEMINI_API_KEY ست باشد، یک جمع‌بندی هم اضافه می‌شود
@@ -20,8 +20,11 @@ import requests
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("btc-bot")
 
-TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TOKEN = (os.getenv("BALE_TOKEN") or os.getenv("TELEGRAM_TOKEN", "")).strip()
+CHAT_ID = (os.getenv("BALE_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+API_BASE = os.getenv("BALE_API_BASE", "https://tapi.bale.ai").strip().rstrip("/")
+# بله پیام‌ها را Markdown نمایش می‌دهد. اگر این متغیر را خالی بگذاری، parse_mode اصلاً ارسال نمی‌شود
+PARSE_MODE = os.getenv("PARSE_MODE", "Markdown").strip()
 INTERVAL_MIN = float(os.getenv("INTERVAL_MIN", "5"))  # هر چند دقیقه ارسال شود (2 یا 5)
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # اختیاری
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -259,7 +262,8 @@ def ai_comment(a5, a15):
             headers={"x-goog-api-key": GEMINI_KEY},
             json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30)
         r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        txt = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return re.sub(r"[*_`]", "", txt)
     except Exception as e:
         log.warning("Gemini failed: %s", type(e).__name__)
         return ""
@@ -278,13 +282,13 @@ def build_message():
            f"<b>{verdict(a5, a15)}</b>")
     ai = ai_comment(a5, a15)
     if ai:
-        msg += f"\n\n🤖 {html.escape(ai)}"
+        msg += f"\n\n🤖 {ai}"
     msg += "\n\n<i>تحلیل الگوریتمی و آموزشی است، توصیه مالی نیست.</i>"
     return msg
 
 
-# ---------------------------------------------------------------- تلگرام
-API = f"https://api.telegram.org/bot{TOKEN}"
+# ---------------------------------------------------------------- بله
+API = f"{API_BASE}/bot{TOKEN}"
 state = {"auto": True, "interval": INTERVAL_MIN}
 INTERVAL_CHOICES = [2, 5, 10]
 _FA = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
@@ -310,41 +314,53 @@ def now_str():
     return datetime.now(TZ).strftime("%H:%M:%S")
 
 
-def plain(text):
-    return html.unescape(re.sub(r"<[^>]+>", "", text))
+def to_bale(text):
+    """متن‌ها داخل کد با تگ <b> و <i> نوشته شده‌اند؛ اینجا به Markdown بله تبدیل می‌شوند."""
+    text = re.sub(r"</?b>", "*", text)
+    text = re.sub(r"</?i>", "_", text)
+    return html.unescape(text)
+
+
+def strip_markup(text):
+    return text.replace("*", "").replace("_", "")
 
 
 def call(method, **payload):
     try:
         return HTTP.post(f"{API}/{method}", json=payload, timeout=20)
     except Exception as e:
-        log.error("Telegram %s failed: %s", method, type(e).__name__)
+        log.error("Bale %s failed: %s", method, type(e).__name__)
         return None
 
 
 def _deliver(method, payload):
     r = call(method, **payload)
-    if r is not None and r.status_code == 400 and "parse entities" in r.text:
+    if r is not None and r.status_code == 400 and "parse_mode" in payload:
+        # اگر قالب‌بندی مشکل داشت، یک بار بدون قالب‌بندی دوباره بفرست
         payload = dict(payload)
         payload.pop("parse_mode", None)
-        payload["text"] = plain(payload["text"])
+        payload["text"] = strip_markup(payload["text"])
         r = call(method, **payload)
     if r is not None and not r.ok and "not modified" not in r.text:
-        log.error("Telegram error: %s", r.text[:200])
+        log.error("Bale error: %s", r.text[:200])
     return r
 
 
 def send(text, markup=None, chat_id=None):
-    p = {"chat_id": chat_id or CHAT_ID, "text": text, "parse_mode": "HTML",
+    p = {"chat_id": chat_id or CHAT_ID, "text": to_bale(text),
          "disable_web_page_preview": True}
+    if PARSE_MODE:
+        p["parse_mode"] = PARSE_MODE
     if markup:
         p["reply_markup"] = markup
     return _deliver("sendMessage", p)
 
 
 def edit(chat_id, message_id, text, markup=None):
-    p = {"chat_id": chat_id, "message_id": message_id, "text": text,
-         "parse_mode": "HTML", "disable_web_page_preview": True}
+    p = {"chat_id": chat_id, "message_id": message_id, "text": to_bale(text),
+         "disable_web_page_preview": True}
+    if PARSE_MODE:
+        p["parse_mode"] = PARSE_MODE
     if markup:
         p["reply_markup"] = markup
     _deliver("editMessageText", p)
@@ -514,6 +530,8 @@ def handle_callback(cq):
     cid, data = cq["id"], cq.get("data", "")
     msg = cq.get("message") or {}
     chat_id = msg.get("chat", {}).get("id")
+    if chat_id is None:
+        chat_id = (cq.get("from") or {}).get("id")  # اگر بله پیام را نفرستاد
     mid = msg.get("message_id")
     if chat_id is None:
         answer(cid, "خطا در تشخیص چت")
@@ -532,7 +550,10 @@ def handle_callback(cq):
     elif data.startswith("re_"):
         answer(cid, "🔄 در حال تازه‌سازی...")
         kind = data[3:]
-        edit(chat_id, mid, safe_content(kind), result_markup(kind))
+        if mid is None:
+            send(safe_content(kind), result_markup(kind), chat_id=chat_id)
+        else:
+            edit(chat_id, mid, safe_content(kind), result_markup(kind))
     elif data == "menu":
         answer(cid)
         send(menu_text(), menu_markup(chat_id), chat_id=chat_id)
@@ -564,7 +585,7 @@ def handle_message(m):
     t = (m.get("text") or "").strip().lower()
     chat_type = m.get("chat", {}).get("type", "")
     if t.startswith("/start"):
-        if chat_type == "private":
+        if chat_type in ("private", ""):
             subscribe(chat_id, m.get("from", {}))
             send("✅ عضویت شما فعال شد. از این به بعد سیگنال‌های جدید برایتان ارسال می‌شود.\nبرای لغو عضویت: /stop", chat_id=chat_id)
         send(menu_text(), menu_markup(chat_id), chat_id=chat_id)
@@ -590,13 +611,20 @@ def poll_loop():
     offset = None
     while True:
         try:
+            started = time.time()
             r = HTTP.get(f"{API}/getUpdates", timeout=45,
-                         params={"timeout": 30, "offset": offset,
-                                 "allowed_updates": '["message","callback_query"]'})
+                         params={"timeout": 30, "offset": offset})
             if r.status_code == 409:  # دو نسخه هم‌زمان (هنگام دیپلوی)؛ کمی صبر کن
                 time.sleep(10)
                 continue
-            for u in r.json().get("result", []):
+            if not r.ok:
+                log.warning("getUpdates HTTP %s: %s", r.status_code, r.text[:150])
+                time.sleep(5)
+                continue
+            updates = r.json().get("result", [])
+            if not updates and time.time() - started < 1:
+                time.sleep(1)  # اگر long-polling پشتیبانی نشد، API را شلوغ نکن
+            for u in updates:
                 offset = u["update_id"] + 1
                 try:
                     if "callback_query" in u:
@@ -665,10 +693,10 @@ def keep_alive():
 
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("TELEGRAM_TOKEN باید در Environment ست شود")
+        raise SystemExit("BALE_TOKEN باید در Environment ست شود")
     init_subscribers_db()
     if not CHAT_ID:
-        log.warning("TELEGRAM_CHAT_ID تنظیم نشده؛ ارسال خودکار اختصاصی مدیر غیرفعال است")
+        log.warning("BALE_CHAT_ID تنظیم نشده؛ ارسال خودکار اختصاصی مدیر غیرفعال است")
     threading.Thread(target=bot_loop, daemon=True).start()
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
